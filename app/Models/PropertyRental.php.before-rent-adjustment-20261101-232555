@@ -1,0 +1,84 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class PropertyRental extends Model
+{
+    protected $table = 'property_rentals';
+
+    protected $fillable = [
+        'reference',
+        'property_id',
+        'customer_id',
+        'agent_id',
+        'created_by',
+        'start_date',
+        'end_date',
+        'monthly_rent',
+        'security_deposit',
+        'currency',
+        'status',
+        'payment_due_day',
+        'activated_at',
+        'terminated_at',
+        'termination_reason',
+        'notes',
+    ];
+
+    protected $casts = [
+        'start_date' => 'date',
+        'end_date' => 'date',
+        'monthly_rent' => 'decimal:2',
+        'security_deposit' => 'decimal:2',
+        'activated_at' => 'datetime',
+        'terminated_at' => 'datetime',
+    ];
+
+    public function property(): BelongsTo
+    {
+        return $this->belongsTo(Property::class);
+    }
+
+    public function customer(): BelongsTo
+    {
+        return $this->belongsTo(Customer::class);
+    }
+
+    public function agent(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'agent_id');
+    }
+
+    public function creator(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'created_by');
+    }
+
+    public function statusHistory(): HasMany
+    {
+        return $this->hasMany(
+            PropertyRentalStatusHistory::class,
+            'property_rental_id'
+        );
+    }
+
+    public function rentSchedules(): HasMany
+    {
+        return $this->hasMany(
+            PropertyRentSchedule::class,
+            'property_rental_id'
+        );
+    }
+    public function payments(): HasMany
+    {
+        return $this->hasMany(
+            PropertyRentPayment::class,
+            'property_rental_id'
+        );
+    }
+
+}

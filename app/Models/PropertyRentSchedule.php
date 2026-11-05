@@ -1,0 +1,53 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class PropertyRentSchedule extends Model
+{
+    protected $table = 'property_rent_schedules';
+
+    protected $fillable = [
+        'property_rental_id',
+        'reference',
+        'period_start',
+        'period_end',
+        'due_date',
+        'amount_due',
+        'currency',
+        'status',
+    ];
+
+    protected $casts = [
+        'period_start' => 'date',
+        'period_end' => 'date',
+        'due_date' => 'date',
+        'amount_due' => 'decimal:2',
+    ];
+
+    public function rental(): BelongsTo
+    {
+        return $this->belongsTo(
+            PropertyRental::class,
+            'property_rental_id'
+        );
+    }
+    public function allocations(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(
+            PropertyRentPaymentAllocation::class,
+            'property_rent_schedule_id'
+        );
+    }
+
+    public function adjustments(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(
+            PropertyRentAdjustment::class,
+            'property_rent_schedule_id'
+        );
+    }
+
+}

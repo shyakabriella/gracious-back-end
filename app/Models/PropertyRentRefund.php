@@ -1,0 +1,116 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class PropertyRentRefund extends Model
+{
+    protected $table = 'property_rent_refunds';
+
+    protected $attributes = [
+        'status' => 'pending',
+    ];
+
+    protected $fillable = [
+        'reference',
+        'property_rental_id',
+        'property_rent_payment_id',
+        'amount',
+        'currency',
+        'status',
+        'reason',
+        'rejection_reason',
+        'refund_method',
+        'transaction_reference',
+        'refunded_at',
+        'requested_by',
+        'approved_by',
+        'approved_at',
+        'processed_by',
+    ];
+
+    protected function casts(): array
+    {
+        return [
+            'amount' => 'decimal:2',
+            'refunded_at' => 'date',
+            'approved_at' => 'datetime',
+        ];
+    }
+
+    public function rental(): BelongsTo
+    {
+        return $this->belongsTo(
+            PropertyRental::class,
+            'property_rental_id'
+        );
+    }
+
+    public function payment(): BelongsTo
+    {
+        return $this->belongsTo(
+            PropertyRentPayment::class,
+            'property_rent_payment_id'
+        );
+    }
+
+    public function requester(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class,
+            'requested_by'
+        );
+    }
+
+    public function approver(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class,
+            'approved_by'
+        );
+    }
+
+    public function processor(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class,
+            'processed_by'
+        );
+    }
+
+    public function destination(): HasOne
+    {
+        return $this->hasOne(
+            PropertyRentRefundDestination::class,
+            'property_rent_refund_id'
+        );
+    }
+
+    public function reconciliation(): HasOne
+    {
+        return $this->hasOne(
+            PropertyRentRefundReconciliation::class,
+            'property_rent_refund_id'
+        );
+    }
+
+    public function evidences(): HasMany
+    {
+        return $this->hasMany(
+            PropertyRentRefundEvidence::class,
+            'property_rent_refund_id'
+        );
+    }
+
+    public function statusHistory(): HasMany
+    {
+        return $this->hasMany(
+            PropertyRentRefundStatusHistory::class,
+            'property_rent_refund_id'
+        );
+    }
+}

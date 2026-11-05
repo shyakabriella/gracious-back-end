@@ -1,0 +1,289 @@
+<?php
+
+use App\Models\User;
+use App\Notifications\StaffInvitationNotification;
+use Database\Seeders\RolePermissionSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Notification;
+use Laravel\Sanctum\Sanctum;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->seed(RolePermissionSeeder::class);
+    Notification::fake();
+});
+
+function invitationTestStaff(string $role = 'agent'): User
+{
+    $user = User::factory()->create([
+        'status' => 'active',
+        'password' => Hash::make('TestPassword123!'),
+    ]);
+
+    $user->assignRole($role);
+
+    return $user;
+}
+
+function invitationTestToken(User $user): string
+{
+    $token = null;
+
+    Notification::assertSentTo(
+        $user,
+        StaffInvitationNotification::class,
+        function ($notification) use ($user, &$token) {
+            $message = $notification->toMail($user);
+            $url = $message->actionUrl;
+
+            parse_str(
+                parse_url($url, PHP_URL_QUERY) ?: '',
+                $query
+            );
+
+            $token = $query['token'] ?? null;
+
+            return is_string($token) && strlen($token) >= 32;
+        }
+    );
+
+    return $token;
+}
+
+function invitationTestCreate(
+    $test,
+    User $admin,
+    string $email = 'invited@example.test'
+): User {
+    Sanctum::actingAs($admin);
+
+    $test->postJson('/api/staff/invitations', [
+        'name' => 'Invited Employee',
+        'email' => $email,
+        'role' => 'agent',
+    ])
+        ->assertCreated()
+        ->assertJsonPath('email_sent', true)
+        ->assertJsonPath('user.status', 'suspended');
+
+    return User::where('email', $email)->firstOrFail();
+}
+
+test('super admin can invite staff without a temporary password', function () {
+    $admin = invitationTestStaff('super_admin');
+
+    $user = invitationTestCreate($this, $admin);
+
+    expect($user->status)->toBe('suspended');
+    expect($user->hasRole('agent'))->toBeTrue();
+
+    $this->assertDatabaseHas('staff_invitations', [
+        'user_id' => $user->id,
+        'used_at' => null,
+        'revoked_at' => null,
+    ]);
+
+    invitationTestToken($user);
+});
+
+test('agent cannot create staff invitations', function () {
+    $agent = invitationTestStaff('agent');
+
+    Sanctum::actingAs($agent);
+
+    $this->postJson('/api/staff/invitations', [
+        'name' => 'Unauthorized Employee',
+        'email' => 'unauthorized@example.test',
+        'role' => 'agent',
+    ])->assertForbidden();
+
+    $this->assertDatabaseMissing('users', [
+        'email' => 'unauthorized@example.test',
+    ]);
+});
+
+test('invited staff cannot log in before password setup', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+
+    $this->postJson('/api/login', [
+        'email' => $user->email,
+        'password' => 'RandomPassword123!',
+    ])->assertUnprocessable();
+
+    expect($user->fresh()->status)->toBe('suspended');
+});
+
+test('manual activation cannot bypass pending invitation', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/users/{$user->id}/status", [
+        'status' => 'active',
+    ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['status']);
+
+    expect($user->fresh()->status)->toBe('suspended');
+});
+
+test('valid invitation sets password and activates employee', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+
+    $token = invitationTestToken($user);
+
+    $this->postJson('/api/staff/invitations/accept', [
+        'email' => $user->email,
+        'token' => $token,
+        'password' => 'NewEmployeePassword123!',
+        'password_confirmation' => 'NewEmployeePassword123!',
+    ])->assertOk();
+
+    $user->refresh();
+
+    expect($user->status)->toBe('active');
+    expect(Hash::check(
+        'NewEmployeePassword123!',
+        $user->password
+    ))->toBeTrue();
+
+    $this->assertDatabaseHas('staff_invitations', [
+        'user_id' => $user->id,
+    ]);
+
+    expect(
+        DB::table('staff_invitations')
+            ->where('user_id', $user->id)
+            ->whereNotNull('used_at')
+            ->exists()
+    )->toBeTrue();
+});
+
+test('accepted invitation cannot be used twice', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+    $token = invitationTestToken($user);
+
+    $payload = [
+        'email' => $user->email,
+        'token' => $token,
+        'password' => 'NewEmployeePassword123!',
+        'password_confirmation' => 'NewEmployeePassword123!',
+    ];
+
+    $this->postJson('/api/staff/invitations/accept', $payload)
+        ->assertOk();
+
+    $this->postJson('/api/staff/invitations/accept', $payload)
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['token']);
+});
+
+test('expired invitation cannot activate employee', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+    $token = invitationTestToken($user);
+
+    DB::table('staff_invitations')
+        ->where('user_id', $user->id)
+        ->update(['expires_at' => now()->subMinute()]);
+
+    $this->postJson('/api/staff/invitations/accept', [
+        'email' => $user->email,
+        'token' => $token,
+        'password' => 'NewEmployeePassword123!',
+        'password_confirmation' => 'NewEmployeePassword123!',
+    ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['token']);
+
+    expect($user->fresh()->status)->toBe('suspended');
+});
+
+test('resending invitation invalidates previous token', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+    $oldToken = invitationTestToken($user);
+
+    Notification::fake();
+
+    Sanctum::actingAs($admin);
+
+    $this->postJson(
+        "/api/staff/{$user->id}/invitation/resend"
+    )
+        ->assertOk()
+        ->assertJsonPath('email_sent', true);
+
+    $newToken = invitationTestToken($user);
+
+    expect($oldToken)->not->toBe($newToken);
+
+    $this->postJson('/api/staff/invitations/accept', [
+        'email' => $user->email,
+        'token' => $oldToken,
+        'password' => 'NewEmployeePassword123!',
+        'password_confirmation' => 'NewEmployeePassword123!',
+    ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['token']);
+
+    $this->postJson('/api/staff/invitations/accept', [
+        'email' => $user->email,
+        'token' => $newToken,
+        'password' => 'NewEmployeePassword123!',
+        'password_confirmation' => 'NewEmployeePassword123!',
+    ])->assertOk();
+
+    expect($user->fresh()->status)->toBe('active');
+});
+
+test('revoked invitation cannot be accepted', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+    $token = invitationTestToken($user);
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/users/{$user->id}/status", [
+        'status' => 'suspended',
+    ])->assertOk();
+
+    expect(
+        DB::table('staff_invitations')
+            ->where('user_id', $user->id)
+            ->whereNotNull('revoked_at')
+            ->exists()
+    )->toBeTrue();
+
+    $this->postJson('/api/staff/invitations/accept', [
+        'email' => $user->email,
+        'token' => $token,
+        'password' => 'NewEmployeePassword123!',
+        'password_confirmation' => 'NewEmployeePassword123!',
+    ])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors(['token']);
+
+    expect($user->fresh()->status)->toBe('suspended');
+});
+
+test('non admin cannot resend invitations', function () {
+    $admin = invitationTestStaff('super_admin');
+    $user = invitationTestCreate($this, $admin);
+
+    $agent = invitationTestStaff('agent');
+
+    Sanctum::actingAs($agent);
+
+    $this->postJson(
+        "/api/staff/{$user->id}/invitation/resend"
+    )->assertForbidden();
+});
+

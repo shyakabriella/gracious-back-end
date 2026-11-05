@@ -1,0 +1,175 @@
+<?php
+
+use App\Models\PropertyRentPayment;
+use Database\Seeders\RolePermissionSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Laravel\Sanctum\Sanctum;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->seed(RolePermissionSeeder::class);
+});
+
+function rentPaymentFixture(): array
+{
+    // Reuse the rental fixture from the existing
+    // PropertyRentalStatusTest only if it is available.
+    if (!function_exists('leaseStatusFixture')) {
+        require_once __DIR__ . '/PropertyRentalStatusTest.php';
+    }
+
+    return leaseStatusFixture('active');
+}
+
+function rentPaymentPayload(
+    string $reference = 'BANK-RENT-001'
+): array {
+    return [
+        'payment_method' => 'bank_transfer',
+        'amount' => '100000.00',
+        'transaction_reference' => $reference,
+        'payment_date' => now()->toDateString(),
+        'notes' => 'Monthly rental payment.',
+    ];
+}
+
+test('rental payment routes require authentication', function () {
+    $this->getJson('/api/rentals/1/payments')
+        ->assertUnauthorized();
+
+    $this->postJson('/api/rentals/1/payments', [])
+        ->assertUnauthorized();
+});
+
+test('admin can record a pending rental payment', function () {
+    [$admin, $agent, $property, $rental] = rentPaymentFixture();
+
+    Sanctum::actingAs($admin);
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        rentPaymentPayload()
+    )
+        ->assertCreated()
+        ->assertJsonPath('payment.status', 'pending')
+        ->assertJsonPath('payment.currency', 'RWF');
+
+    expect($rental->payments()->count())->toBe(1);
+
+    $this->assertDatabaseHas(
+        'property_rent_payment_status_histories',
+        [
+            'to_status' => 'pending',
+            'changed_by' => $admin->id,
+        ]
+    );
+});
+
+test('pending rent payment does not reduce balance', function () {
+    [$admin, $agent, $property, $rental] = rentPaymentFixture();
+
+    // A directly constructed active lease does not yet
+    // have generated schedules in the test fixture.
+    app(\App\Services\PropertyRentScheduleService::class)
+        ->generate($rental);
+
+    Sanctum::actingAs($admin);
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        rentPaymentPayload('BANK-PENDING-002')
+    )->assertCreated();
+
+    $this->getJson("/api/rentals/{$rental->id}/payments")
+        ->assertOk()
+        ->assertJsonPath('summary.verified_paid', '0.00')
+        ->assertJsonPath(
+            'summary.total_billed',
+            $rental->rentSchedules()
+                ->selectRaw('SUM(amount_due) AS total')
+                ->value('total')
+        );
+});
+
+test('duplicate rental transaction reference is rejected', function () {
+    [$admin, $agent, $property, $rental] = rentPaymentFixture();
+
+    app(\App\Services\PropertyRentScheduleService::class)
+        ->generate($rental);
+
+    Sanctum::actingAs($admin);
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        rentPaymentPayload('BANK-DUPLICATE-003')
+    )->assertCreated();
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        rentPaymentPayload('BANK-DUPLICATE-003')
+    )
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('transaction_reference');
+
+    expect($rental->payments()->count())->toBe(1);
+});
+
+test('agent cannot record rental payments', function () {
+    [$admin, $agent, $property, $rental] = rentPaymentFixture();
+
+    Sanctum::actingAs($agent);
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        rentPaymentPayload('BANK-AGENT-004')
+    )->assertForbidden();
+});
+
+test('unrelated agent cannot access rental payment details', function () {
+    [$admin, $agent, $property, $rental] = rentPaymentFixture();
+
+    $otherAgent = leaseStatusUser('agent');
+
+    Sanctum::actingAs($otherAgent);
+
+    $this->getJson("/api/rentals/{$rental->id}/payments")
+        ->assertNotFound();
+});
+
+test('draft rental cannot receive payments', function () {
+    [$admin, $agent, $property, $rental] =
+        leaseStatusFixture('draft');
+
+    Sanctum::actingAs($admin);
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        rentPaymentPayload('BANK-DRAFT-005')
+    )
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('rental');
+});
+
+test('rental payment cannot exceed scheduled rent', function () {
+    [$admin, $agent, $property, $rental] = rentPaymentFixture();
+
+    $rental->forceFill([
+        'monthly_rent' => '10000.00',
+    ])->save();
+
+    app(\App\Services\PropertyRentScheduleService::class)
+        ->generate($rental);
+
+    Sanctum::actingAs($admin);
+
+    $payload = rentPaymentPayload('BANK-OVERPAY-006');
+    $payload['amount'] = '999999999.00';
+
+    $this->postJson(
+        "/api/rentals/{$rental->id}/payments",
+        $payload
+    )
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('amount');
+});

@@ -1,0 +1,228 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\PropertyRental;
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class PropertyRentTerminationAdjustmentService
+{
+    private function cents(string $value): int
+    {
+        if (!preg_match('/^\d+(\.\d{1,2})?$/', $value)) {
+            throw ValidationException::withMessages([
+                'amount' => ['Invalid monetary amount.'],
+            ]);
+        }
+
+        [$whole, $fraction] = array_pad(
+            explode('.', $value, 2),
+            2,
+            '0'
+        );
+
+        if (strlen(ltrim($whole, '0')) > 13) {
+            throw ValidationException::withMessages([
+                'amount' => ['Amount exceeds the supported limit.'],
+            ]);
+        }
+
+        return (int) $whole * 100
+            + (int) str_pad($fraction, 2, '0');
+    }
+
+    private function money(int $cents): string
+    {
+        return intdiv($cents, 100) . '.'
+            . str_pad(
+                (string) ($cents % 100),
+                2,
+                '0',
+                STR_PAD_LEFT
+            );
+    }
+
+    /**
+     * Caller must hold a rental row lock inside a DB transaction.
+     *
+     * Move-out date is inclusive: the tenant pays for that day.
+     * Existing rent schedules are never changed or deleted.
+     */
+    public function apply(
+        PropertyRental $rental,
+        string $moveOutDate,
+        int $createdBy,
+        string $reason
+    ): int {
+        $moveOut = CarbonImmutable::parse($moveOutDate)
+            ->startOfDay();
+
+        $leaseStart = CarbonImmutable::parse(
+            $rental->start_date
+        )->startOfDay();
+
+        $leaseEnd = CarbonImmutable::parse(
+            $rental->end_date
+        )->startOfDay();
+
+        if ($moveOut->lt($leaseStart) || $moveOut->gt($leaseEnd)) {
+            throw ValidationException::withMessages([
+                'move_out_date' => [
+                    'Move-out date must fall within the lease dates.',
+                ],
+            ]);
+        }
+
+        if (trim($reason) === '') {
+            throw ValidationException::withMessages([
+                'reason' => ['Termination reason is required.'],
+            ]);
+        }
+
+        $schedules = $rental->rentSchedules()
+            ->orderBy('period_start')
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+
+        if ($schedules->isEmpty()) {
+            throw ValidationException::withMessages([
+                'rental' => ['No rent schedules exist for this lease.'],
+            ]);
+        }
+
+        if ($rental->adjustments()
+            ->where('type', 'early_termination')
+            ->exists()) {
+            throw ValidationException::withMessages([
+                'status' => [
+                    'Early-termination adjustments already exist.',
+                ],
+            ]);
+        }
+
+        $created = 0;
+
+        foreach ($schedules as $schedule) {
+            $periodStart = CarbonImmutable::parse(
+                $schedule->period_start
+            )->startOfDay();
+
+            $periodEnd = CarbonImmutable::parse(
+                $schedule->period_end
+            )->startOfDay();
+
+            if ($periodEnd->lte($moveOut)) {
+                continue;
+            }
+
+            $originalCents = $this->cents(
+                (string) $schedule->amount_due
+            );
+
+            if ($periodStart->gt($moveOut)) {
+                // Entire bill is for time after move-out.
+                $creditCents = $originalCents;
+            } else {
+                // Prorate the unused part of the billed period.
+                $totalDays = (int) $periodStart
+                    ->diffInDays($periodEnd) + 1;
+
+                $unusedDays = (int) $moveOut
+                    ->diffInDays($periodEnd);
+
+                $creditCents = intdiv(
+                    $originalCents * $unusedDays
+                        + intdiv($totalDays, 2),
+                    $totalDays
+                );
+            }
+
+            if ($creditCents <= 0) {
+                continue;
+            }
+
+            $verifiedPaid = DB::table(
+                'property_rent_payment_allocations as a'
+            )
+                ->join(
+                    'property_rent_payments as p',
+                    'p.id',
+                    '=',
+                    'a.property_rent_payment_id'
+                )
+                ->where(
+                    'a.property_rent_schedule_id',
+                    $schedule->id
+                )
+                ->where(
+                    'p.property_rental_id',
+                    $rental->id
+                )
+                ->where('p.status', 'verified')
+                ->selectRaw(
+                    'COALESCE(SUM(a.amount), 0) AS total'
+                )
+                ->value('total');
+
+            $paidCents = $this->cents(
+                (string) $verifiedPaid
+            );
+
+            $existingCredits = $this->cents(
+                (string) $schedule->adjustments()
+                    ->whereIn('type', [
+                        'manual_credit',
+                        'early_termination',
+                    ])
+                    ->sum('amount')
+            );
+
+            $existingDebits = $this->cents(
+                (string) $schedule->adjustments()
+                    ->where('type', 'manual_debit')
+                    ->sum('amount')
+            );
+
+            $revisedCents = $originalCents
+                + $existingDebits
+                - $existingCredits
+                - $creditCents;
+
+            if ($revisedCents < 0) {
+                throw ValidationException::withMessages([
+                    'move_out_date' => [
+                        'Termination credit would make rent negative '
+                        . 'for schedule '
+                        . $schedule->reference
+                        . '. Review existing adjustments.',
+                    ],
+                ]);
+            }
+
+            // Prepaid rent may exceed the revised charge.
+            // Preserve verified allocations without modifying them.
+            // The difference becomes a refundable credit,
+            // subject to separate refund authorization.
+
+            $rental->adjustments()->create([
+                'property_rent_schedule_id' => $schedule->id,
+                'reference' => 'RADJ-'
+                    . Str::upper(Str::random(20)),
+                'type' => 'early_termination',
+                'amount' => $this->money($creditCents),
+                'currency' => $rental->currency,
+                'reason' => $reason,
+                'effective_date' => $moveOut->toDateString(),
+                'created_by' => $createdBy,
+            ]);
+
+            $created++;
+        }
+
+        return $created;
+    }
+}

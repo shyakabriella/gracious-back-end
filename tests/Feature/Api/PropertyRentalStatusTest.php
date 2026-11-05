@@ -1,0 +1,391 @@
+<?php
+
+use App\Models\Customer;
+use App\Models\Property;
+use App\Models\PropertyCategory;
+use App\Models\PropertyRental;
+use App\Models\User;
+use Database\Seeders\RolePermissionSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Laravel\Sanctum\Sanctum;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->seed(RolePermissionSeeder::class);
+});
+
+function leaseStatusUser(string $role): User
+{
+    $user = User::factory()->create(['status' => 'active']);
+    $user->assignRole($role);
+
+    return $user;
+}
+
+function leaseStatusFixture(
+    string $status = 'draft',
+    ?string $startDate = null,
+    ?string $endDate = null
+): array {
+    $admin = leaseStatusUser('admin');
+    $agent = leaseStatusUser('agent');
+
+    $category = PropertyCategory::firstOrCreate(
+        ['slug' => 'lease-status-test'],
+        ['name' => 'Lease Status Test', 'is_active' => true]
+    );
+
+    $property = Property::create([
+        'reference' => 'PROP-' . uniqid(),
+        'title' => 'Lease Status Property',
+        'slug' => 'lease-status-' . uniqid(),
+        'category_id' => $category->id,
+        'listing_type' => 'rent',
+        'asking_price' => 350000,
+        'currency' => 'RWF',
+        'agent_id' => $agent->id,
+        'created_by' => $admin->id,
+    ]);
+
+    $property->forceFill([
+        'verification_status' => 'verified',
+        'availability_status' => $status === 'active'
+            ? 'rented' : 'available',
+        'is_published' => $status !== 'active',
+    ])->save();
+
+    $customer = Customer::create([
+        'reference' => 'CUS-' . uniqid(),
+        'name' => 'Lease Status Tenant',
+        'created_by' => $admin->id,
+    ]);
+
+    $rental = PropertyRental::create([
+        'reference' => 'RENT-' . uniqid(),
+        'property_id' => $property->id,
+        'customer_id' => $customer->id,
+        'agent_id' => $agent->id,
+        'created_by' => $admin->id,
+        'start_date' => $startDate
+            ?? now()->subMonth()->toDateString(),
+        'end_date' => $endDate
+            ?? now()->addMonths(11)->toDateString(),
+        'monthly_rent' => 350000,
+        'security_deposit' => 700000,
+        'currency' => 'RWF',
+        'payment_due_day' => 5,
+        'status' => $status,
+        'activated_at' => $status === 'active'
+            ? now()->subMonth() : null,
+    ]);
+
+    $rental->statusHistory()->create([
+        'from_status' => null,
+        'to_status' => $status,
+        'notes' => 'Test rental created.',
+        'changed_by' => $admin->id,
+    ]);
+
+    return [$admin, $agent, $property, $rental];
+}
+
+test('lease activation requires authentication', function () {
+    $this->patchJson('/api/rentals/1/activate')
+        ->assertUnauthorized();
+});
+
+test('admin can activate lease and mark property rented', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertOk()
+        ->assertJsonPath('rental.status', 'active')
+        ->assertJsonPath(
+            'rental.property.availability_status',
+            'rented'
+        );
+
+    expect($rental->fresh()->activated_at)->not->toBeNull();
+    expect($property->fresh()->is_published)->toBeFalse();
+
+    $this->assertDatabaseHas('property_rental_status_histories', [
+        'property_rental_id' => $rental->id,
+        'from_status' => 'draft',
+        'to_status' => 'active',
+        'changed_by' => $admin->id,
+    ]);
+});
+
+test('agents cannot activate rental agreements', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($agent);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertForbidden();
+
+    expect($rental->fresh()->status)->toBe('draft');
+});
+
+test('future lease cannot activate before start date', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture(
+        'draft',
+        now()->addDays(10)->toDateString(),
+        now()->addYear()->toDateString()
+    );
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('start_date');
+
+    expect($rental->fresh()->status)->toBe('draft');
+});
+
+test('active lease cannot be activated again', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertOk();
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('status');
+
+    expect(
+        $rental->statusHistory()
+            ->where('to_status', 'active')->count()
+    )->toBe(1);
+});
+
+test('manager can cancel a draft with reason', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs(leaseStatusUser('property_manager'));
+
+    $this->patchJson("/api/rentals/{$rental->id}/cancel", [
+        'reason' => 'Tenant withdrew the rental request.',
+    ])
+        ->assertOk()
+        ->assertJsonPath('rental.status', 'cancelled');
+
+    expect($property->fresh()->availability_status)
+        ->toBe('available');
+});
+
+test('cancelling draft requires a reason', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/cancel", [])
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('reason');
+});
+
+test('admin can terminate active lease and unpublish property', function () {
+    [$admin, $agent, $property, $rental] =
+        leaseStatusFixture('active');
+
+    // Real lease activation generates rent schedules.
+    // Reproduce that requirement in this test fixture.
+    app(\App\Services\PropertyRentScheduleService::class)
+        ->generate($rental);
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/terminate", [
+        'reason' => 'Tenant completed early move-out.',
+        'move_out_date' => now()->toDateString(),
+    ])
+        ->assertOk()
+        ->assertJsonPath('rental.status', 'terminated')
+        ->assertJsonPath(
+            'rental.property.availability_status',
+            'available'
+        );
+
+    expect($property->fresh()->is_published)->toBeFalse();
+    expect($rental->fresh()->terminated_at)->not->toBeNull();
+});
+
+test('expired lease can be closed after its end date', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture(
+        'active',
+        now()->subYear()->toDateString(),
+        now()->subDay()->toDateString()
+    );
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/expire")
+        ->assertOk()
+        ->assertJsonPath('rental.status', 'expired');
+
+    expect($property->fresh()->availability_status)
+        ->toBe('available');
+});
+
+test('active lease cannot expire before end date', function () {
+    [$admin, $agent, $property, $rental] =
+        leaseStatusFixture('active');
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/expire")
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('end_date');
+});
+
+test('active lease blocks manual property availability changes', function () {
+    [$admin, $agent, $property, $rental] =
+        leaseStatusFixture('active');
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson(
+        "/api/properties/{$property->id}/availability",
+        ['status' => 'available']
+    )
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('status');
+
+    expect($property->fresh()->availability_status)
+        ->toBe('rented');
+});
+
+test('property cannot be marked rented without active lease', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson(
+        "/api/properties/{$property->id}/availability",
+        ['status' => 'rented']
+    )
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('status');
+});
+
+test('assigned agent can see lease history but unrelated agent cannot', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($agent);
+
+    $this->getJson("/api/rentals/{$rental->id}/history")
+        ->assertOk()
+        ->assertJsonCount(1, 'history');
+
+    Sanctum::actingAs(leaseStatusUser('agent'));
+
+    $this->getJson("/api/rentals/{$rental->id}/history")
+        ->assertNotFound();
+});
+
+test('activation generates anniversary rent schedules with daily proration', function () {
+    $this->travelTo(
+        \Carbon\Carbon::parse('2026-11-20 12:00:00')
+    );
+
+    [$admin, $agent, $property, $rental] = leaseStatusFixture(
+        'draft',
+        '2026-11-15',
+        '2027-01-24'
+    );
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertOk()
+        ->assertJsonPath('rental.status', 'active');
+
+    $schedules = $rental->rentSchedules()
+        ->orderBy('period_start')
+        ->get();
+
+    expect($schedules)->toHaveCount(3);
+
+    expect($schedules[0]->period_start->toDateString())
+        ->toBe('2026-11-15');
+    expect($schedules[0]->period_end->toDateString())
+        ->toBe('2026-12-14');
+
+    expect($schedules[1]->period_start->toDateString())
+        ->toBe('2026-12-15');
+    expect($schedules[1]->period_end->toDateString())
+        ->toBe('2027-01-14');
+
+    expect($schedules[2]->period_start->toDateString())
+        ->toBe('2027-01-15');
+    expect($schedules[2]->period_end->toDateString())
+        ->toBe('2027-01-24');
+
+    expect((string) $schedules[0]->amount_due)->toBe('350000.00');
+    expect((string) $schedules[1]->amount_due)->toBe('350000.00');
+    expect((string) $schedules[2]->amount_due)->toBe('112903.23');
+
+    expect($schedules->pluck('status')->unique()->all())
+        ->toBe(['pending']);
+});
+
+test('repeated activation cannot duplicate rental bills', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertOk();
+
+    $originalCount = $rental->rentSchedules()->count();
+
+    expect($originalCount)->toBeGreaterThan(0);
+
+    $this->patchJson("/api/rentals/{$rental->id}/activate")
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('status');
+
+    expect($rental->rentSchedules()->count())
+        ->toBe($originalCount);
+});
+
+test('draft and cancelled leases do not generate rent bills', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    expect($rental->rentSchedules()->count())->toBe(0);
+
+    Sanctum::actingAs($admin);
+
+    $this->patchJson("/api/rentals/{$rental->id}/cancel", [
+        'reason' => 'Tenant cancelled before occupancy.',
+    ])->assertOk();
+
+    expect($rental->rentSchedules()->count())->toBe(0);
+});
+
+test('schedule generation refuses a second set of bills', function () {
+    [$admin, $agent, $property, $rental] = leaseStatusFixture();
+
+    $service = app(
+        \App\Services\PropertyRentScheduleService::class
+    );
+
+    $firstCount = $service->generate($rental);
+
+    expect($firstCount)->toBeGreaterThan(0);
+
+    try {
+        $service->generate($rental);
+        test()->fail('Duplicate generation should be rejected.');
+    } catch (\Illuminate\Validation\ValidationException $exception) {
+        expect($exception->errors())->toHaveKey('status');
+    }
+
+    expect($rental->rentSchedules()->count())
+        ->toBe($firstCount);
+});

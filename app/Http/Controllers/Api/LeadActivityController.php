@@ -1,0 +1,99 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Lead;
+use App\Models\User;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
+
+class LeadActivityController extends Controller
+{
+    private function canAccess(User $user, Lead $lead): bool
+    {
+        return $user->hasAnyRole(['super_admin', 'admin'])
+            || $lead->created_by === $user->id
+            || $lead->assigned_agent_id === $user->id;
+    }
+
+    public function store(Request $request, Lead $lead): JsonResponse
+    {
+        abort_unless($request->user()->can('leads.update'), 403);
+        abort_unless($this->canAccess($request->user(), $lead), 404);
+
+        $data = $request->validate([
+            'activity_type' => [
+                'required',
+                Rule::in([
+                    'note', 'call', 'email', 'meeting', 'follow_up',
+                ]),
+            ],
+            'description' => ['required', 'string', 'max:5000'],
+            'scheduled_at' => ['nullable', 'date', 'after:now'],
+            'completed_at' => ['nullable', 'date', 'before_or_equal:now'],
+        ]);
+
+        if (
+            $data['activity_type'] === 'follow_up'
+            && empty($data['scheduled_at'])
+        ) {
+            throw ValidationException::withMessages([
+                'scheduled_at' => [
+                    'A follow-up date is required.',
+                ],
+            ]);
+        }
+
+        if (
+            !empty($data['scheduled_at'])
+            && !empty($data['completed_at'])
+        ) {
+            throw ValidationException::withMessages([
+                'completed_at' => [
+                    'A future scheduled activity cannot already be completed.',
+                ],
+            ]);
+        }
+
+        $activity = DB::transaction(function () use ($request, $lead, $data) {
+            $lead = Lead::query()
+                ->lockForUpdate()
+                ->findOrFail($lead->id);
+
+            abort_unless(
+                $this->canAccess($request->user(), $lead),
+                404
+            );
+
+            $activity = $lead->activities()->create([
+                ...$data,
+                'created_by' => $request->user()->id,
+            ]);
+
+            if ($data['activity_type'] === 'follow_up') {
+                $next = $lead->activities()
+                    ->where('activity_type', 'follow_up')
+                    ->whereNull('completed_at')
+                    ->whereNotNull('scheduled_at')
+                    ->orderBy('scheduled_at')
+                    ->orderBy('id')
+                    ->first();
+
+                $lead->update([
+                    'next_follow_up_at' => $next?->scheduled_at,
+                ]);
+            }
+
+            return $activity;
+        });
+
+        return response()->json([
+            'message' => 'Lead activity recorded successfully',
+            'activity' => $activity->load('creator:id,name'),
+        ], 201);
+    }
+}

@@ -1,0 +1,229 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\PropertyRental;
+use App\Models\PropertyRentPayment;
+use App\Services\PropertyRentPaymentAllocationService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+
+class PropertyRentPaymentVerificationController extends Controller
+{
+    private function authorizeReviewer(Request $request): void
+    {
+        abort_unless(
+            $request->user()->hasAnyRole([
+                'super_admin',
+                'admin',
+            ]) && $request->user()->can('rentals.update'),
+            403
+        );
+    }
+
+    public function verify(
+        Request $request,
+        PropertyRental $rental,
+        PropertyRentPayment $payment
+    ): JsonResponse {
+        $this->authorizeReviewer($request);
+
+        abort_unless(
+            (int) $payment->property_rental_id === (int) $rental->id,
+            404
+        );
+
+        $updated = DB::transaction(function () use (
+            $request,
+            $rental,
+            $payment
+        ) {
+            // Always lock rental first to serialize payments
+            // for the same rental agreement.
+            $rental = PropertyRental::query()
+                ->lockForUpdate()
+                ->findOrFail($rental->id);
+
+            $payment = PropertyRentPayment::query()
+                ->lockForUpdate()
+                ->findOrFail($payment->id);
+
+            abort_unless(
+                (int) $payment->property_rental_id
+                    === (int) $rental->id,
+                404
+            );
+
+            if ($payment->status !== 'pending') {
+                throw ValidationException::withMessages([
+                    'status' => [
+                        'This payment has already been reviewed.',
+                    ],
+                ]);
+            }
+
+            if (!in_array(
+                $rental->status,
+                ['active', 'terminated', 'expired'],
+                true
+            )) {
+                throw ValidationException::withMessages([
+                    'rental' => [
+                        'Only active, terminated or expired leases '
+                        . 'can receive verified rent payments.',
+                    ],
+                ]);
+            }
+
+            if (!$payment->evidences()->exists()) {
+                throw ValidationException::withMessages([
+                    'evidence' => [
+                        'Upload payment evidence before verification.',
+                    ],
+                ]);
+            }
+
+            // Allocate before marking as verified.
+            // The transaction makes this operation atomic.
+            app(PropertyRentPaymentAllocationService::class)
+                ->allocate($rental, $payment);
+
+            $payment->forceFill([
+                'status' => 'verified',
+                'verified_by' => $request->user()->id,
+                'verified_at' => now(),
+                'rejection_reason' => null,
+            ])->save();
+
+            $payment->statusHistory()->create([
+                'from_status' => 'pending',
+                'to_status' => 'verified',
+                'notes' => 'Rental payment evidence reviewed and verified.',
+                'changed_by' => $request->user()->id,
+            ]);
+
+            return $payment->fresh([
+                'allocations.schedule:id,reference,period_start,period_end,amount_due',
+                'verifier:id,name',
+            ]);
+        }, 3);
+
+        return response()->json([
+            'message' => 'Rental payment verified and allocated successfully.',
+            'payment' => $updated,
+        ]);
+    }
+
+    public function reject(
+        Request $request,
+        PropertyRental $rental,
+        PropertyRentPayment $payment
+    ): JsonResponse {
+        $this->authorizeReviewer($request);
+
+        abort_unless(
+            (int) $payment->property_rental_id === (int) $rental->id,
+            404
+        );
+
+        $data = $request->validate([
+            'reason' => [
+                'required',
+                'string',
+                'min:5',
+                'max:2000',
+            ],
+        ]);
+
+        $updated = DB::transaction(function () use (
+            $request,
+            $rental,
+            $payment,
+            $data
+        ) {
+            $rental = PropertyRental::query()
+                ->lockForUpdate()
+                ->findOrFail($rental->id);
+
+            $payment = PropertyRentPayment::query()
+                ->lockForUpdate()
+                ->findOrFail($payment->id);
+
+            abort_unless(
+                (int) $payment->property_rental_id
+                    === (int) $rental->id,
+                404
+            );
+
+            if ($payment->status !== 'pending') {
+                throw ValidationException::withMessages([
+                    'status' => [
+                        'This payment has already been reviewed.',
+                    ],
+                ]);
+            }
+
+            $payment->forceFill([
+                'status' => 'rejected',
+                'rejection_reason' => $data['reason'],
+                'verified_by' => $request->user()->id,
+                'verified_at' => null,
+            ])->save();
+
+            $payment->statusHistory()->create([
+                'from_status' => 'pending',
+                'to_status' => 'rejected',
+                'notes' => $data['reason'],
+                'changed_by' => $request->user()->id,
+            ]);
+
+            return $payment->fresh(['verifier:id,name']);
+        }, 3);
+
+        return response()->json([
+            'message' => 'Rental payment rejected.',
+            'payment' => $updated,
+        ]);
+    }
+
+    public function history(
+        Request $request,
+        PropertyRental $rental,
+        PropertyRentPayment $payment
+    ): JsonResponse {
+        abort_unless(
+            $request->user()->can('rentals.view'),
+            403
+        );
+
+        $user = $request->user();
+
+        abort_unless(
+            $user->hasAnyRole([
+                'super_admin',
+                'admin',
+                'property_manager',
+                'accountant',
+            ]) || (
+                $user->hasRole('agent')
+                && (int) $rental->agent_id === (int) $user->id
+            ),
+            404
+        );
+
+        abort_unless(
+            (int) $payment->property_rental_id === (int) $rental->id,
+            404
+        );
+
+        return response()->json([
+            'history' => $payment->statusHistory()
+                ->with('changedBy:id,name')
+                ->orderBy('id')
+                ->get(),
+        ]);
+    }
+}

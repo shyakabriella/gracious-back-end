@@ -1,0 +1,234 @@
+<?php
+
+use App\Models\PropertyRental;
+use App\Services\PropertyRentScheduleService;
+use App\Services\PropertyRentTerminationAdjustmentService;
+use Database\Seeders\RolePermissionSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->seed(RolePermissionSeeder::class);
+});
+
+function terminationAdjustmentFixture(): array
+{
+    if (!function_exists('leaseStatusFixture')) {
+        require_once __DIR__ . '/PropertyRentalStatusTest.php';
+    }
+
+    [$admin, $agent, $property, $rental] =
+        leaseStatusFixture('active');
+
+    app(PropertyRentScheduleService::class)->generate($rental);
+
+    return [$admin, $rental];
+}
+
+function applyTerminationAdjustment(
+    PropertyRental $rental,
+    int $adminId,
+    string $moveOutDate
+): int {
+    return DB::transaction(function () use (
+        $rental,
+        $adminId,
+        $moveOutDate
+    ) {
+        $locked = PropertyRental::query()
+            ->lockForUpdate()
+            ->findOrFail($rental->id);
+
+        return app(PropertyRentTerminationAdjustmentService::class)
+            ->apply(
+                $locked,
+                $moveOutDate,
+                $adminId,
+                'Tenant moved out early.'
+            );
+    });
+}
+
+test('future rental bills receive full termination credits', function () {
+    [$admin, $rental] = terminationAdjustmentFixture();
+
+    $schedules = $rental->rentSchedules()
+        ->orderBy('period_start')
+        ->get();
+
+    expect($schedules->count())->toBeGreaterThanOrEqual(3);
+
+    $moveOut = $schedules[0]->period_end->toDateString();
+
+    $created = applyTerminationAdjustment(
+        $rental,
+        $admin->id,
+        $moveOut
+    );
+
+    expect($created)->toBe($schedules->count() - 1);
+
+    $future = $schedules[1];
+
+    $credit = $future->adjustments()
+        ->where('type', 'early_termination')
+        ->firstOrFail();
+
+    expect((string) $credit->amount)
+        ->toBe((string) $future->amount_due);
+});
+
+test('partial month is credited using daily proration', function () {
+    [$admin, $rental] = terminationAdjustmentFixture();
+
+    $schedule = $rental->rentSchedules()
+        ->orderBy('period_start')
+        ->firstOrFail();
+
+    $start = \Carbon\CarbonImmutable::parse(
+        $schedule->period_start
+    );
+
+    $end = \Carbon\CarbonImmutable::parse(
+        $schedule->period_end
+    );
+
+    $moveOut = $start->addDays(9);
+
+    $originalCents = (int) round(
+        (float) $schedule->amount_due * 100
+    );
+
+    $totalDays = (int) $start->diffInDays($end) + 1;
+    $unusedDays = (int) $moveOut->diffInDays($end);
+
+    $expectedCents = intdiv(
+        $originalCents * $unusedDays
+            + intdiv($totalDays, 2),
+        $totalDays
+    );
+
+    applyTerminationAdjustment(
+        $rental,
+        $admin->id,
+        $moveOut->toDateString()
+    );
+
+    $credit = $schedule->adjustments()
+        ->where('type', 'early_termination')
+        ->firstOrFail();
+
+    expect((int) round((float) $credit->amount * 100))
+        ->toBe($expectedCents);
+});
+
+test('original rental bills remain unchanged after credits', function () {
+    [$admin, $rental] = terminationAdjustmentFixture();
+
+    $schedule = $rental->rentSchedules()
+        ->orderBy('period_start')
+        ->firstOrFail();
+
+    $original = (string) $schedule->amount_due;
+
+    applyTerminationAdjustment(
+        $rental,
+        $admin->id,
+        $schedule->period_start->addDays(5)->toDateString()
+    );
+
+    expect((string) $schedule->fresh()->amount_due)
+        ->toBe($original);
+});
+
+test('duplicate early termination adjustments are rejected', function () {
+    [$admin, $rental] = terminationAdjustmentFixture();
+
+    $date = $rental->rentSchedules()
+        ->orderBy('period_start')
+        ->firstOrFail()
+        ->period_start
+        ->addDays(5)
+        ->toDateString();
+
+    applyTerminationAdjustment($rental, $admin->id, $date);
+
+    expect(fn () => applyTerminationAdjustment(
+        $rental,
+        $admin->id,
+        $date
+    ))->toThrow(ValidationException::class);
+});
+
+test('prepaid termination preserves verified rent and creates credit', function () {
+    [$admin, $rental] = terminationAdjustmentFixture();
+
+    $schedule = $rental->rentSchedules()
+        ->orderBy('period_start')
+        ->firstOrFail();
+
+    $payment = $rental->payments()->create([
+        'reference' => 'RPAY-TERMINATION-TEST',
+        'payment_method' => 'cash',
+        'amount' => (string) $schedule->amount_due,
+        'currency' => $rental->currency,
+        'payment_date' => now()->toDateString(),
+        'status' => 'verified',
+        'recorded_by' => $admin->id,
+        'verified_by' => $admin->id,
+        'verified_at' => now(),
+    ]);
+
+    $payment->allocations()->create([
+        'property_rent_schedule_id' => $schedule->id,
+        'amount' => (string) $schedule->amount_due,
+    ]);
+
+    $date = $schedule->period_start
+        ->addDays(5)
+        ->toDateString();
+
+    $created = applyTerminationAdjustment(
+        $rental,
+        $admin->id,
+        $date
+    );
+
+    expect($created)->toBeGreaterThan(0);
+
+    expect($payment->fresh()->status)->toBe('verified');
+
+    expect(
+        (string) $payment->allocations()->sum('amount')
+    )->toBe((string) $schedule->amount_due);
+
+    $statement = app(
+        \App\Services\PropertyRentStatementService::class
+    )->build($rental);
+
+    expect($statement['summary']['total_outstanding'])
+        ->toBe('0.00');
+
+    expect(
+        (float) $statement['summary']['overpayment']
+    )->toBeGreaterThan(0);
+});
+
+test('move out date outside lease period is rejected', function () {
+    [$admin, $rental] = terminationAdjustmentFixture();
+
+    $invalidDate = $rental->start_date
+        ->subDay()
+        ->toDateString();
+
+    expect(fn () => applyTerminationAdjustment(
+        $rental,
+        $admin->id,
+        $invalidDate
+    ))->toThrow(ValidationException::class);
+
+    expect($rental->adjustments()->count())->toBe(0);
+});

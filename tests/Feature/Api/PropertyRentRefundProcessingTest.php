@@ -1,0 +1,222 @@
+<?php
+
+use App\Models\User;
+use App\Models\PropertyRentRefund;
+use Database\Seeders\RolePermissionSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Laravel\Sanctum\Sanctum;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->seed(RolePermissionSeeder::class);
+});
+
+function refundProcessingFixture(): array
+{
+    if (!function_exists('refundApprovalFixture')) {
+        require_once __DIR__ . '/PropertyRentRefundApprovalTest.php';
+    }
+
+    [$requester, $approver, $agent, $rental, $payment, $refundId] =
+        refundApprovalFixture();
+
+    Sanctum::actingAs($approver);
+
+    test()->patchJson(
+        "/api/rentals/{$rental->id}/refunds/{$refundId}/approve"
+    )->assertOk();
+
+    $processor = User::factory()->create([
+        'status' => 'active',
+    ]);
+
+    $processor->assignRole('super_admin');
+
+    Sanctum::actingAs($requester);
+
+    test()->postJson(
+        "/api/rentals/{$rental->id}/refunds/{$refundId}/destination",
+        [
+            'refund_method' => 'bank_transfer',
+            'recipient_name' => 'Test Tenant',
+            'recipient_identifier' => 'TEST-ACCOUNT-123456',
+            'provider_name' => 'Test Bank',
+        ]
+    )->assertCreated();
+
+    Sanctum::actingAs($approver);
+
+    test()->patchJson(
+        "/api/rentals/{$rental->id}/refunds/{$refundId}/destination/approve"
+    )->assertOk();
+
+    $url = "/api/rentals/{$rental->id}/refunds/"
+        . "{$refundId}/process";
+
+    $payload = [
+        'refund_method' => 'bank_transfer',
+        'transaction_reference' =>
+            'BANK-' . bin2hex(random_bytes(8)),
+    ];
+
+    return [
+        $requester,
+        $approver,
+        $processor,
+        $agent,
+        $rental,
+        $refundId,
+        $url,
+        $payload,
+    ];
+}
+
+test('independent officer can start refund processing', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    Sanctum::actingAs($processor);
+
+    $this->patchJson($url, $payload)
+        ->assertOk()
+        ->assertJsonPath('refund.status', 'processing')
+        ->assertJsonPath('refund.processed_by', $processor->id)
+        ->assertJsonPath('refund.refund_method', 'bank_transfer');
+
+    $this->assertDatabaseHas(
+        'property_rent_refund_status_histories',
+        [
+            'property_rent_refund_id' => $refundId,
+            'from_status' => 'approved',
+            'to_status' => 'processing',
+            'changed_by' => $processor->id,
+        ]
+    );
+
+    $refund = PropertyRentRefund::findOrFail($refundId);
+
+    expect($refund->refunded_at)->toBeNull();
+});
+
+test('requester cannot process their own refund', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    Sanctum::actingAs($requester);
+
+    $this->patchJson($url, $payload)
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('processing');
+});
+
+test('approver cannot process the same refund', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    Sanctum::actingAs($approver);
+
+    $this->patchJson($url, $payload)
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('processing');
+});
+
+test('agent cannot start refund processing', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    Sanctum::actingAs($agent);
+
+    $this->patchJson($url, $payload)->assertForbidden();
+});
+
+test('a refund cannot be processed twice', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    Sanctum::actingAs($processor);
+
+    $this->patchJson($url, $payload)->assertOk();
+
+    $this->patchJson($url, $payload)
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('status');
+
+    expect(
+        PropertyRentRefund::findOrFail($refundId)->status
+    )->toBe('processing');
+});
+
+test('another refund cannot reuse a transaction reference', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    Sanctum::actingAs($processor);
+
+    $this->patchJson($url, $payload)->assertOk();
+
+    $original = PropertyRentRefund::findOrFail($refundId);
+
+    $other = PropertyRentRefund::create([
+        'reference' => 'RREF-TEST-' . bin2hex(random_bytes(8)),
+        'property_rental_id' => $rental->id,
+        'property_rent_payment_id' =>
+            $original->property_rent_payment_id,
+        'amount' => '1.00',
+        'currency' => $rental->currency,
+        'status' => 'approved',
+        'reason' => 'Test duplicate transfer reference.',
+        'requested_by' => $requester->id,
+        'approved_by' => $approver->id,
+        'approved_at' => now(),
+    ]);
+
+    \App\Models\PropertyRentRefundDestination::create([
+        'property_rent_refund_id' => $other->id,
+        'refund_method' => 'bank_transfer',
+        'recipient_name' => 'Test Tenant',
+        'recipient_identifier' => 'TEST-ACCOUNT-OTHER',
+        'provider_name' => 'Test Bank',
+        'status' => 'approved',
+        'recorded_by' => $requester->id,
+        'approved_by' => $approver->id,
+        'approved_at' => now(),
+    ]);
+
+    $this->patchJson(
+        "/api/rentals/{$rental->id}/refunds/"
+        . "{$other->id}/process",
+        $payload
+    )
+        ->assertUnprocessable()
+        ->assertJsonValidationErrors('transaction_reference');
+
+    expect($other->fresh()->status)->toBe('approved');
+});
+
+test('refund cannot process through another rental', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    if (!function_exists('leaseStatusFixture')) {
+        require_once __DIR__ . '/PropertyRentalStatusTest.php';
+    }
+
+    [$otherAdmin, $otherAgent, $otherProperty, $otherRental] =
+        leaseStatusFixture('active');
+
+    Sanctum::actingAs($processor);
+
+    $this->patchJson(
+        "/api/rentals/{$otherRental->id}/refunds/"
+        . "{$refundId}/process",
+        $payload
+    )->assertNotFound();
+});

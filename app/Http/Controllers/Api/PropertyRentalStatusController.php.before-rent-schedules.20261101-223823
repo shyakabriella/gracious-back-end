@@ -1,0 +1,269 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Property;
+use App\Models\PropertyRental;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+
+class PropertyRentalStatusController extends Controller
+{
+    private function manager(Request $request): bool
+    {
+        return $request->user()->hasAnyRole([
+            'super_admin',
+            'admin',
+            'property_manager',
+        ]);
+    }
+
+    private function authorizeChange(Request $request): void
+    {
+        abort_unless(
+            $this->manager($request)
+            && $request->user()->can('rentals.update'),
+            403
+        );
+    }
+
+    private function transition(
+        Request $request,
+        PropertyRental $rental,
+        string $action,
+        ?string $reason = null
+    ): JsonResponse {
+        $updated = DB::transaction(function () use (
+            $request,
+            $rental,
+            $action,
+            $reason
+        ) {
+            // Lock property first, consistent with rental registration.
+            $property = Property::query()
+                ->lockForUpdate()
+                ->findOrFail($rental->property_id);
+
+            $rental = PropertyRental::query()
+                ->lockForUpdate()
+                ->findOrFail($rental->id);
+
+            $from = $rental->status;
+            $today = now()->toDateString();
+
+            if ($action === 'activate') {
+                if ($from !== 'draft') {
+                    throw ValidationException::withMessages([
+                        'status' => ['Only draft leases can be activated.'],
+                    ]);
+                }
+
+                if (
+                    $rental->start_date->toDateString() > $today
+                    || $rental->end_date->toDateString() < $today
+                ) {
+                    throw ValidationException::withMessages([
+                        'start_date' => [
+                            'The current date must fall within the lease period.',
+                        ],
+                    ]);
+                }
+
+                if (
+                    $property->listing_type !== 'rent'
+                    || $property->verification_status !== 'verified'
+                    || $property->availability_status !== 'available'
+                    || !$property->is_published
+                ) {
+                    throw ValidationException::withMessages([
+                        'property_id' => [
+                            'Property is not eligible for lease activation.',
+                        ],
+                    ]);
+                }
+
+                $otherActive = PropertyRental::query()
+                    ->where('property_id', $property->id)
+                    ->where('status', 'active')
+                    ->whereKeyNot($rental->id)
+                    ->exists();
+
+                if ($otherActive) {
+                    throw ValidationException::withMessages([
+                        'property_id' => [
+                            'Another lease is already active for this property.',
+                        ],
+                    ]);
+                }
+
+                $rental->forceFill([
+                    'status' => 'active',
+                    'activated_at' => now(),
+                ])->save();
+
+                $property->forceFill([
+                    'availability_status' => 'rented',
+                    'is_published' => false,
+                    'published_at' => null,
+                    'is_featured' => false,
+                ])->save();
+
+                $to = 'active';
+            } elseif ($action === 'cancel') {
+                if ($from !== 'draft') {
+                    throw ValidationException::withMessages([
+                        'status' => ['Only draft leases can be cancelled.'],
+                    ]);
+                }
+
+                $rental->forceFill([
+                    'status' => 'cancelled',
+                    'termination_reason' => $reason,
+                ])->save();
+
+                $to = 'cancelled';
+            } elseif ($action === 'terminate' || $action === 'expire') {
+                if ($from !== 'active') {
+                    throw ValidationException::withMessages([
+                        'status' => [
+                            'Only active leases can be ended.',
+                        ],
+                    ]);
+                }
+
+                if ($property->availability_status !== 'rented') {
+                    throw ValidationException::withMessages([
+                        'property_id' => [
+                            'Property status does not match the active lease.',
+                        ],
+                    ]);
+                }
+
+                if (
+                    $action === 'expire'
+                    && $rental->end_date->toDateString() >= $today
+                ) {
+                    throw ValidationException::withMessages([
+                        'end_date' => [
+                            'Lease expiration is allowed after the end date.',
+                        ],
+                    ]);
+                }
+
+                $to = $action === 'expire' ? 'expired' : 'terminated';
+
+                $rental->forceFill([
+                    'status' => $to,
+                    'terminated_at' => now(),
+                    'termination_reason' => $reason,
+                ])->save();
+
+                // Do not automatically republish the listing.
+                // Staff must confirm that the property is ready.
+                $property->forceFill([
+                    'availability_status' => 'available',
+                    'is_published' => false,
+                    'published_at' => null,
+                    'is_featured' => false,
+                ])->save();
+            } else {
+                abort(404);
+            }
+
+            $rental->statusHistory()->create([
+                'from_status' => $from,
+                'to_status' => $to,
+                'notes' => $reason ?? "Rental lease {$action}.",
+                'changed_by' => $request->user()->id,
+            ]);
+
+            return $rental->fresh([
+                'property:id,reference,title,availability_status,is_published',
+                'customer:id,reference,name',
+                'agent:id,name',
+            ]);
+        }, 3);
+
+        return response()->json([
+            'message' => "Rental lease {$action} successful.",
+            'rental' => $updated,
+        ]);
+    }
+
+    public function activate(
+        Request $request,
+        PropertyRental $rental
+    ): JsonResponse {
+        $this->authorizeChange($request);
+
+        return $this->transition($request, $rental, 'activate');
+    }
+
+    public function cancel(
+        Request $request,
+        PropertyRental $rental
+    ): JsonResponse {
+        $this->authorizeChange($request);
+
+        $data = $request->validate([
+            'reason' => ['required', 'string', 'min:5', 'max:2000'],
+        ]);
+
+        return $this->transition(
+            $request, $rental, 'cancel', $data['reason']
+        );
+    }
+
+    public function terminate(
+        Request $request,
+        PropertyRental $rental
+    ): JsonResponse {
+        $this->authorizeChange($request);
+
+        $data = $request->validate([
+            'reason' => ['required', 'string', 'min:5', 'max:2000'],
+        ]);
+
+        return $this->transition(
+            $request, $rental, 'terminate', $data['reason']
+        );
+    }
+
+    public function expire(
+        Request $request,
+        PropertyRental $rental
+    ): JsonResponse {
+        $this->authorizeChange($request);
+
+        return $this->transition($request, $rental, 'expire');
+    }
+
+    public function history(
+        Request $request,
+        PropertyRental $rental
+    ): JsonResponse {
+        abort_unless($request->user()->can('rentals.view'), 403);
+
+        $user = $request->user();
+
+        if (!$user->hasAnyRole([
+            'super_admin', 'admin', 'property_manager', 'accountant',
+        ])) {
+            abort_unless(
+                $user->hasRole('agent')
+                && (int) $rental->agent_id === (int) $user->id,
+                404
+            );
+        }
+
+        return response()->json([
+            'history' => $rental->statusHistory()
+                ->with('changedBy:id,name')
+                ->orderBy('id')
+                ->get(),
+        ]);
+    }
+}

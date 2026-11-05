@@ -1,0 +1,66 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create(
+            'property_rent_refund_reconciliations',
+            function (Blueprint $table) {
+                $table->id();
+
+                $table->foreignId('property_rent_refund_id')
+                    ->unique('rent_refund_reconcile_unique')
+                    ->constrained('property_rent_refunds')
+                    ->restrictOnDelete();
+
+                $table->foreignId('evidence_id')
+                    ->constrained(
+                        'property_rent_refund_evidences'
+                    )
+                    ->restrictOnDelete();
+
+                $table->string('confirmation_source', 100);
+
+                $table->string(
+                    'provider_transaction_reference',
+                    255
+                );
+
+                $table->decimal('confirmed_amount', 18, 2);
+                $table->string('currency', 10);
+
+                $table->string('outcome', 30);
+
+                $table->foreignId('verified_by')
+                    ->constrained('users')
+                    ->restrictOnDelete();
+
+                $table->timestamp('verified_at');
+
+                $table->text('verification_notes')->nullable();
+
+                $table->timestamps();
+
+                $table->unique(
+                    [
+                        'confirmation_source',
+                        'provider_transaction_reference',
+                    ],
+                    'rent_refund_provider_ref_unique'
+                );
+            }
+        );
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists(
+            'property_rent_refund_reconciliations'
+        );
+    }
+};
