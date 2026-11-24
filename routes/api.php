@@ -47,6 +47,27 @@ use App\Http\Controllers\Api\PropertyRentRefundReconciliationController;
 use Illuminate\Support\Facades\Route;
 
 
+// Public form taxonomy: return active category names and IDs only.
+Route::get('/public/property-categories', static function () {
+    return response()->json([
+        'data' => \App\Models\PropertyCategory::query()
+            ->where('is_active', true)
+            ->orderBy('name')
+            ->get(['id', 'name']),
+    ]);
+})->middleware('throttle:30,1');
+
+// Private applicant media, protected by a short-lived upload token.
+Route::post('/public/property-submissions/{submission}/media', [
+    \App\Http\Controllers\Api\PublicPropertySubmissionMediaController::class,
+    'store',
+])->middleware('throttle:12,1');
+
+Route::post('/public/property-submissions', [
+    \App\Http\Controllers\Api\PublicPropertySubmissionController::class,
+    'store',
+])->middleware('throttle:5,1');
+
 Route::post('/public/properties/{slug}/inquiries', [
     PublicPropertyInquiryController::class, 'store'
 ])->middleware('throttle:5,1');
@@ -111,6 +132,73 @@ Route::middleware([
     Route::patch('/customers/{customer}/link-account', [
         CustomerAccountLinkController::class,
         'store',
+    ]);
+
+    // Staff-only property submission review inbox.
+    Route::get('/property-submissions', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionController::class,
+        'index',
+    ]);
+
+    Route::get('/property-submissions/{submission}', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionController::class,
+        'show',
+    ]);
+
+    // Authorized administrator review decisions.
+    Route::patch('/property-submissions/{submission}/start-review', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionReviewController::class,
+        'startReview',
+    ]);
+
+    Route::patch('/property-submissions/{submission}/reject', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionReviewController::class,
+        'reject',
+    ]);
+
+    // Staff-only contact and ownership verification.
+    Route::post('/property-submissions/{submission}/verifications', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionVerificationController::class,
+        'store',
+    ]);
+
+    Route::get('/property-submissions/{submission}/verifications', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionVerificationController::class,
+        'history',
+    ]);
+
+    // Private property submission evidence: authorized staff only.
+    Route::get('/property-submissions/{submission}/evidence', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionEvidenceController::class,
+        'index',
+    ]);
+
+    Route::post('/property-submissions/{submission}/evidence', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionEvidenceController::class,
+        'store',
+    ]);
+
+    Route::get('/property-submissions/{submission}/evidence/{evidence}/download', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionEvidenceController::class,
+        'download',
+    ]);
+
+    // Independent owner confirmation: authorized staff only.
+    Route::post('/property-submissions/{submission}/owner-confirmations', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionOwnerConfirmationController::class,
+        'store',
+    ]);
+
+    Route::get('/property-submissions/{submission}/owner-confirmations', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionOwnerConfirmationController::class,
+        'history',
+    ]);
+
+    // Final approval: restricted to authorized administrators.
+    // Approval does not create or publish an official property.
+    Route::post('/property-submissions/{submission}/approve', [
+        \App\Http\Controllers\Api\StaffPropertySubmissionApprovalController::class,
+        'approve',
     ]);
 
     Route::get('/property-categories', [
