@@ -20,7 +20,7 @@ class PropertyRentRefundProcessingController extends Controller
         $user = $request->user();
 
         abort_unless(
-            $user->can('rentals.update')
+            $user->can('rentals.refunds.process')
             && $user->hasAnyRole([
                 'super_admin',
                 'admin',

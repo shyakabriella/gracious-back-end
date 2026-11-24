@@ -34,6 +34,7 @@ use App\Http\Controllers\Api\PropertySaleCompletionDocumentController;
 use App\Http\Controllers\Api\PropertyRentalController;
 use App\Http\Controllers\Api\PropertyRentalStatusController;
 use App\Http\Controllers\Api\PropertyRentPaymentController;
+use App\Http\Controllers\Api\DashboardPaymentController;
 use App\Http\Controllers\Api\PropertyRentPaymentEvidenceController;
 use App\Http\Controllers\Api\PropertyRentPaymentVerificationController;
 use App\Http\Controllers\Api\PropertyRentStatementController;
@@ -356,6 +357,12 @@ Route::middleware([
 
     Route::get('/rentals/{rental}/refunds/{refund}/evidences/{evidence}/download', [
         PropertyRentRefundEvidenceController::class, 'download'
+    ]);
+
+    // Read-only company payments dashboard.
+    // Permissions are checked independently for rentals and sales.
+    Route::get('/dashboard/payments', [
+        DashboardPaymentController::class, 'index'
     ]);
 
     Route::get('/rentals/{rental}/payments', [

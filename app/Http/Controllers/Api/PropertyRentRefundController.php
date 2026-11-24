@@ -73,6 +73,7 @@ class PropertyRentRefundController extends Controller
                     'requester:id,name',
                     'approver:id,name',
                     'processor:id,name',
+                    'destination:id,property_rent_refund_id,status,refund_method,recorded_by,approved_by',
                 ])
                 ->latest('id')
                 ->get(),

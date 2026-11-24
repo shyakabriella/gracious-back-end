@@ -220,3 +220,60 @@ test('refund cannot process through another rental', function () {
         $payload
     )->assertNotFound();
 });
+
+
+test('accountant with dedicated permission can process a refund', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    $accountant = User::factory()->create([
+        'status' => 'active',
+    ]);
+
+    $accountant->assignRole('accountant');
+
+    expect($accountant->can('rentals.refunds.process'))
+        ->toBeTrue();
+
+    expect($accountant->can('rentals.update'))
+        ->toBeFalse();
+
+    Sanctum::actingAs($accountant);
+
+    $this->patchJson($url, $payload)
+        ->assertOk()
+        ->assertJsonPath('refund.status', 'processing')
+        ->assertJsonPath('refund.processed_by', $accountant->id);
+
+    $refund = PropertyRentRefund::findOrFail($refundId);
+
+    expect($refund->refunded_at)->toBeNull();
+});
+
+test('property manager cannot process a refund', function () {
+    [$requester, $approver, $processor, $agent,
+        $rental, $refundId, $url, $payload] =
+        refundProcessingFixture();
+
+    $manager = User::factory()->create([
+        'status' => 'active',
+    ]);
+
+    $manager->assignRole('property_manager');
+
+    expect($manager->can('rentals.update'))
+        ->toBeTrue();
+
+    expect($manager->can('rentals.refunds.process'))
+        ->toBeFalse();
+
+    Sanctum::actingAs($manager);
+
+    $this->patchJson($url, $payload)
+        ->assertForbidden();
+
+    expect(
+        PropertyRentRefund::findOrFail($refundId)->status
+    )->toBe('approved');
+});
